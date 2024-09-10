@@ -25,3 +25,5 @@ Homeblock/Townspawn Markers (stars)
 
 ### Additional Information
 any derivative work must also be distributed under the same license, ensuring that the software and any modifications remain free
+
+discord: https://discord.gg/rCQDsj9Dax
