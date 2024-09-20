@@ -9,9 +9,12 @@ from tkinter import ttk, messagebox
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 import matplotlib.colors as mcolors
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 
 API_NATIONS = "https://api.earthmc.net/v3/aurora/nations"
 API_TOWNS = "https://api.earthmc.net/v3/aurora/towns"
+API_PLAYERS = "https://api.earthmc.net/v3/aurora/players"
 
 def generate_color():
     return mcolors.to_hex(mcolors.hsv_to_rgb((random.random(), 0.7, 0.9)))
@@ -38,13 +41,16 @@ def gentownsmap(towns, show_home_blocks=True, color_mode='random', star_size=250
     grid = np.zeros((grid_height, grid_width))
     colors = []
 
-    if color_mode != 'random' and color_mode != 'Overclaimable' and color_mode != 'No Colors':
+    if color_mode != 'random' and color_mode != 'Overclaimable' and color_mode != 'No Colors' and color_mode != 'Snipeable':
         if color_mode == 'Population Density':
             stat_values = [town['stats']['numResidents'] / max(town['stats']['numTownBlocks'], 1) for town in towns]
         else:
             stat_values = [town['stats'][color_mode] for town in towns]
         log_stat_values = np.log1p(stat_values)
         min_stat, max_stat = min(log_stat_values), max(log_stat_values)
+
+    current_time = int(time.time() * 1000)  # Current time in milliseconds
+    ten_days_ms = 28 * 24 * 60 * 60 * 1000  # 10 days in milliseconds
 
     for town in towns:
         if color_mode == 'No Colors':
@@ -54,6 +60,14 @@ def gentownsmap(towns, show_home_blocks=True, color_mode='random', star_size=250
         elif color_mode == 'Overclaimable':
             if town['status']['isOverClaimed'] and not town['status']['hasOverclaimShield']:
                 color = 'red'
+            else:
+                color = 'grey'
+        elif color_mode == 'Snipeable':
+            if (town['stats']['numResidents'] == 1 and 
+                town['status']['isOpen'] and 
+                'mayor_last_online' in town and 
+                current_time - town['mayor_last_online'] > ten_days_ms):
+                color = 'yellow'
             else:
                 color = 'grey'
         else:
@@ -105,31 +119,77 @@ def get_nation_towns(nation_names):
 
     all_town_names = []
     
-    for nation_batch in batch_requests(nations, batch_size=100):
-        content = {"query": nation_batch}
-        response = requests.post(API_NATIONS, json=content, headers=headers)
-
-        if response.status_code == 200:
-            nation_data = response.json()
-            if nation_data:
-                for nation in nation_data:
-                    all_town_names.extend([town['name'] for town in nation['towns']])
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_batch = {executor.submit(fetch_nation_batch, batch): batch for batch in batch_requests(nations, batch_size=100)}
+        for future in as_completed(future_to_batch):
+            all_town_names.extend(future.result())
 
     return all_town_names
+
+def fetch_nation_batch(nation_batch):
+    headers = {"Content-Type": "application/json"}
+    content = {"query": nation_batch}
+    response = requests.post(API_NATIONS, json=content, headers=headers)
+    town_names = []
+    if response.status_code == 200:
+        nation_data = response.json()
+        if nation_data:
+            for nation in nation_data:
+                town_names.extend([town['name'] for town in nation['towns']])
+    return town_names
 
 def get_town_data(town_names):
     headers = {"Content-Type": "application/json"}
     
     all_town_data = []
 
-    for town_batch in batch_requests(town_names, batch_size=100):
-        content = {"query": town_batch}
-        response = requests.post(API_TOWNS, json=content, headers=headers)
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_batch = {executor.submit(fetch_town_batch, batch): batch for batch in batch_requests(town_names, batch_size=100)}
+        for future in as_completed(future_to_batch):
+            all_town_data.extend(future.result())
 
-        if response.status_code == 200:
-            all_town_data.extend(response.json())
+    # Fetch mayor data for all towns
+    mayor_names = [town['mayor']['name'] for town in all_town_data]
+    mayor_data = get_player_data(mayor_names)
+
+    # Add mayor last online timestamp to town data
+    for town in all_town_data:
+        mayor_name = town['mayor']['name']
+        if mayor_name in mayor_data:
+            town['mayor_last_online'] = mayor_data[mayor_name]['timestamps']['lastOnline']
 
     return all_town_data
+
+def fetch_town_batch(town_batch):
+    headers = {"Content-Type": "application/json"}
+    content = {"query": town_batch}
+    response = requests.post(API_TOWNS, json=content, headers=headers)
+    if response.status_code == 200:
+        return response.json()
+    return []
+
+def get_player_data(player_names):
+    headers = {"Content-Type": "application/json"}
+    
+    all_player_data = {}
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_batch = {executor.submit(fetch_player_batch, batch): batch for batch in batch_requests(player_names, batch_size=100)}
+        for future in as_completed(future_to_batch):
+            all_player_data.update(future.result())
+
+    return all_player_data
+
+def fetch_player_batch(player_batch):
+    headers = {"Content-Type": "application/json"}
+    content = {"query": player_batch}
+    response = requests.post(API_PLAYERS, json=content, headers=headers)
+    player_data = {}
+    if response.status_code == 200:
+        data = response.json()
+        for player in data:
+            player_data[player['name']] = player
+    return player_data
 
 class TownMapApp(tk.Tk):
     def __init__(self):
@@ -191,7 +251,7 @@ class TownMapApp(tk.Tk):
         self.color_mode = tk.StringVar(value='random')
         ttk.Label(input_frame, text="Color Mode:").grid(row=3, column=0, sticky=tk.W, pady=5)
         self.color_mode_combo = ttk.Combobox(input_frame, textvariable=self.color_mode, 
-                                         values=['No Colors', 'random', 'numResidents', 'numTownBlocks', 'numOutlaws', 'numTrusted', 'Overclaimable', 'Population Density'], 
+                                         values=['No Colors', 'random', 'numResidents', 'numTownBlocks', 'numOutlaws', 'numTrusted', 'Overclaimable', 'Population Density', 'Snipeable'], 
                                          state='readonly')
         self.color_mode_combo.grid(row=3, column=1, sticky=tk.W, pady=5)
         self.color_mode_combo.bind('<<ComboboxSelected>>', lambda e: self.update_map())
@@ -230,7 +290,6 @@ class TownMapApp(tk.Tk):
         canvas_widget.grid(row=0, column=0, sticky='nsew')
 
         def on_resize(event):
-            # Adjust the figure size to match the new frame size
             width, height = event.width, event.height
             fig.set_size_inches(width/fig.dpi, height/fig.dpi)
             canvas.draw()
@@ -240,16 +299,14 @@ class TownMapApp(tk.Tk):
         self.update_idletasks()  
 
     def run_generate_map_thread(self):
-        """Runs the map generation process in a separate thread."""
         threading.Thread(target=self.generate_map, daemon=True).start()
 
     def generate_map(self):
-        """This function runs in a background thread and fetches town data."""
         nation_names = self.nation_entry.get()
         town_names = self.town_entry.get()
         
         if not nation_names and not town_names:
-            messagebox.showwarning("Input Error", "Please enter either nation names or individual town names.")
+            self.after(0, lambda: messagebox.showwarning("Input Error", "Please enter either nation names or individual town names."))
             return
 
         nation_towns = get_nation_towns(nation_names) if nation_names else []
@@ -257,7 +314,7 @@ class TownMapApp(tk.Tk):
         all_town_names = nation_towns + town_names_list
 
         if not all_town_names:
-            messagebox.showwarning("Data Error", "No valid town names found.")
+            self.after(0, lambda: messagebox.showwarning("Data Error", "No valid town names found."))
             return
 
         self.town_data = get_town_data(all_town_names)
